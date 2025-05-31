@@ -1,511 +1,466 @@
-require('dotenv').config(); // For local development
-const { Client, GatewayIntentBits, Partials, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, Collection } = require('discord.js');
-const supabase = require('./supabaseClient.js');
-const { zonedTimeToUtc, formatInTimeZone, utcToZonedTime } = require('date-fns-tz');
+const { Client, GatewayIntentBits, Collection } = require('discord.js');
+const supabase = require('./supabase');
+const cron = require('node-cron');
+const { 
+    isAdmin, 
+    parseTimeToNigeria, 
+    createGiveawayEmbed, 
+    createGiveawayButton,
+    createEndedGiveawayEmbed,
+    createCancelledGiveawayEmbed,
+    selectRandomWinners 
+} = require('./utils');
+require('./server'); // Start Express server
 
-const NIGERIA_TIMEZONE = 'Africa/Lagos'; // GMT+1
-
+// Create Discord client
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
-        GatewayIntentBits.DirectMessages,
-    ],
-    partials: [Partials.Channel, Partials.Message], // Required for DMs
+        GatewayIntentBits.DirectMessages
+    ]
 });
 
-const BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
-const PREFIX = process.env.BOT_PREFIX || '.';
-const ADMIN_IDS = process.env.BOT_ADMIN_IDS ? process.env.BOT_ADMIN_IDS.split(',') : [];
+// Store ongoing item creation processes
+const itemCreationProcess = new Collection();
 
-if (!BOT_TOKEN || ADMIN_IDS.length === 0) {
-    console.error("BOT_TOKEN or BOT_ADMIN_IDS are not set. Please check your environment variables.");
-    process.exit(1);
-}
-
-// Helper function to check if a user is an admin
-function isAdmin(userId) {
-    return ADMIN_IDS.includes(userId);
-}
-
-// Helper function to parse time (HH:MMAM/PM) for today in Nigeria time
-function parseEndTime(timeString) {
-    const match = timeString.match(/^(\d{1,2}):(\d{2})(AM|PM)$/i);
-    if (!match) return null;
-
-    let hours = parseInt(match[1]);
-    const minutes = parseInt(match[2]);
-    const period = match[3].toUpperCase();
-
-    if (hours < 1 || hours > 12 || minutes < 0 || minutes > 59) return null;
-
-    if (period === 'PM' && hours !== 12) {
-        hours += 12;
-    } else if (period === 'AM' && hours === 12) { // Midnight case: 12 AM is 00 hours
-        hours = 0;
-    }
-
-    // Create date object for today in Nigeria timezone, then set the parsed time
-    const nowInNigeria = new Date(); // This gets current system time, we need to interpret it as if it's Nigeria time for date part.
-                                  // Then combine with parsed hours/minutes.
-                                  // For safety, it's better to construct the date fully with date-fns-tz
-
-    const year = nowInNigeria.getFullYear();
-    const month = nowInNigeria.getMonth(); // 0-indexed
-    const day = nowInNigeria.getDate();
-
-    // Create a Date object representing the specified time in Nigeria time zone
-    // Note: Date constructor month is 0-indexed.
-    const localTimeInNigeria = new Date(year, month, day, hours, minutes, 0);
-
-    // Check if the parsed time is in the past for today. If so, assume it's for tomorrow.
-    // This logic might need adjustment based on how strictly "today" is interpreted.
-    // For simplicity here, we'll assume valid times are for today, even if slightly in the past,
-    // or the giveaway check will handle it.
-    // A more robust solution would be to explicitly require a date if not today.
-    // The spec says "today", so we proceed with that assumption.
-
-    // Convert this Nigeria local time to UTC for storage
-    return zonedTimeToUtc(localTimeInNigeria, NIGERIA_TIMEZONE);
-}
-
-
+// Bot ready event
 client.once('ready', () => {
-    console.log(`Logged in as ${client.user.tag}!`);
-    console.log(`Admin IDs: ${ADMIN_IDS.join(', ')}`);
-    console.log(`Prefix: ${PREFIX}`);
-    checkEndedGiveaways(); // Check once on startup
-    setInterval(checkEndedGiveaways, 30000); // Check every 30 seconds
+    console.log(`✅ Bot is ready! Logged in as ${client.user.tag}`);
+    
+    // Start giveaway checker (runs every minute)
+    cron.schedule('* * * * *', checkExpiredGiveaways);
 });
 
-client.on('messageCreate', async message => {
+// Message event handler
+client.on('messageCreate', async (message) => {
     if (message.author.bot) return;
-
-    const isDM = message.channel.type === Partials.Channel; // Or use ChannelType.DM after v14.8.0
-    if (isDM && !message.content.startsWith(PREFIX)) { // Allow DMs without prefix for conversation flow of additem
-         // Handle .additem flow or other DM commands
-    } else if (!isDM && !message.content.startsWith(PREFIX)){
+    
+    const isDM = !message.guild;
+    const isAdmin = checkAdmin(message.author.id);
+    
+    // Handle item creation process in DMs
+    if (isDM && itemCreationProcess.has(message.author.id)) {
+        await handleItemCreationStep(message);
         return;
     }
-
-
-    const args = message.content.slice(PREFIX.length).trim().split(/ +/);
+    
+    if (!message.content.startsWith('.')) return;
+    
+    const args = message.content.slice(1).trim().split(/ +/);
     const command = args.shift().toLowerCase();
-
-    // --- ADMIN DM COMMANDS ---
-    if (isDM) {
-        if (!isAdmin(message.author.id)) {
-            // Silently ignore or reply "You are not authorized for DM commands."
-            // For this spec, we assume only admins will DM, but a check is good.
-            // Let commands handle their own admin checks to provide specific feedback.
+    
+    try {
+        switch (command) {
+            case 'additem':
+                if (!isDM) {
+                    return message.reply('❌ This command can only be used in DMs with the bot.');
+                }
+                if (!isAdmin) {
+                    return message.reply('❌ You are not authorized to use this command.');
+                }
+                await handleAddItem(message);
+                break;
+                
+            case 'items':
+                if (!isDM) {
+                    return message.reply('❌ This command can only be used in DMs with the bot.');
+                }
+                if (!isAdmin) {
+                    return message.reply('❌ You are not authorized to use this command.');
+                }
+                await handleListItems(message);
+                break;
+                
+            case 'giveaway':
+                if (isDM) {
+                    return message.reply('❌ This command can only be used in server channels.');
+                }
+                if (!isAdmin) {
+                    return message.reply('❌ You are not authorized to use this command.');
+                }
+                await handleStartGiveaway(message, args);
+                break;
+                
+            case 'cancel':
+                if (isDM) {
+                    return message.reply('❌ This command can only be used in server channels.');
+                }
+                if (!isAdmin) {
+                    return message.reply('❌ You are not authorized to use this command.');
+                }
+                await handleCancelGiveaway(message, args);
+                break;
         }
-
-        if (command === 'additem') {
-            if (!isAdmin(message.author.id)) return message.reply("You are not authorized to use this command.");
-            try {
-                const questions = [
-                    "What is the name of the item? (e.g., 'Free Nitro')",
-                    "Please provide a short description for the item.",
-                    "Please provide an image URL for the item (optional, type 'skip' if none).",
-                ];
-                let answers = [];
-                let item = {};
-
-                const filter = m => m.author.id === message.author.id;
-                const collector = message.channel.createMessageCollector({ filter, time: 60000 * 5 }); // 5 minutes to answer
-
-                let currentQuestion = 0;
-                await message.channel.send(questions[currentQuestion]);
-
-                collector.on('collect', async m => {
-                    if (m.content.toLowerCase() === `${PREFIX}cancel`) { // Allow cancelling mid-process
-                        collector.stop('cancelled');
-                        return message.channel.send("Item addition cancelled.");
-                    }
-                    answers.push(m.content);
-                    currentQuestion++;
-                    if (currentQuestion < questions.length) {
-                        await message.channel.send(questions[currentQuestion]);
-                    } else {
-                        collector.stop('completed');
-                    }
-                });
-
-                collector.on('end', async (collected, reason) => {
-                    if (reason === 'completed') {
-                        item.name = answers[0];
-                        item.description = answers[1];
-                        item.image_url = (answers[2] && answers[2].toLowerCase() !== 'skip' && (answers[2].startsWith('http://') || answers[2].startsWith('https://'))) ? answers[2] : null;
-
-                        const { data, error } = await supabase
-                            .from('items')
-                            .insert([item])
-                            .select()
-                            .single();
-
-                        if (error) {
-                            console.error("Error adding item to Supabase:", error);
-                            return message.channel.send("There was an error adding the item. Please try again.");
-                        }
-                        await message.channel.send(`✅ Item "${data.name}" (ID: ${data.id}) added successfully!`);
-                    } else if (reason === 'time') {
-                        await message.channel.send("Item addition timed out.");
-                    } else if (reason !== 'cancelled') {
-                        await message.channel.send("Something went wrong during item addition.");
-                    }
-                });
-
-            } catch (err) {
-                console.error("Error in additem command:", err);
-                message.reply("An error occurred.");
-            }
-        } else if (command === 'items') {
-            if (!isAdmin(message.author.id)) return message.reply("You are not authorized to use this command.");
-            try {
-                const { data, error } = await supabase.from('items').select('id, name, description');
-                if (error) throw error;
-
-                if (!data || data.length === 0) {
-                    return message.channel.send("No items found in the database.");
-                }
-
-                let response = "📦 **Available Giveaway Items:**\n\n";
-                data.forEach(item => {
-                    response += `**ID:** ${item.id}\n**Name:** ${item.name}\n**Description:** ${item.description || 'N/A'}\n--------------------\n`;
-                });
-
-                if (response.length > 2000) {
-                    // Handle pagination if necessary, for now, just send what fits or split manually
-                    message.channel.send(response.substring(0, 1990) + "...");
-                    // Potentially send multiple messages
-                } else {
-                    message.channel.send(response);
-                }
-            } catch (err) {
-                console.error("Error fetching items:", err);
-                message.channel.send("Error fetching items. See console for details.");
-            }
-        }
-    }
-    // --- ADMIN SERVER COMMANDS ---
-    else if (!isDM) { // Commands used in a server channel
-        if (command === 'giveaway') {
-            if (!isAdmin(message.author.id)) return message.reply("You are not authorized to start giveaways.");
-            if (args.length < 3) {
-                return message.reply(`Usage: ${PREFIX}giveaway <item_id> <end_time HH:MMAM/PM> <winners_count>`);
-            }
-
-            const itemId = parseInt(args[0]);
-            const endTimeString = args[1].toUpperCase();
-            const winnersCount = parseInt(args[2]);
-
-            if (isNaN(itemId) || itemId <= 0) return message.reply("Invalid item ID.");
-            if (isNaN(winnersCount) || winnersCount <= 0) return message.reply("Invalid number of winners.");
-
-            const endTimeUTC = parseEndTime(endTimeString);
-            if (!endTimeUTC) return message.reply("Invalid time format. Use HH:MMAM or HH:MMPM (e.g., 9:00AM or 10:30PM).");
-
-            if (endTimeUTC <= new Date()) { // Check if parsed time is in the past
-                return message.reply("The end time cannot be in the past.");
-            }
-
-            try {
-                const { data: itemData, error: itemError } = await supabase
-                    .from('items')
-                    .select('name, description, image_url')
-                    .eq('id', itemId)
-                    .single();
-
-                if (itemError || !itemData) {
-                    console.error("Error fetching item or item not found:", itemError);
-                    return message.reply(`Item with ID ${itemId} not found.`);
-                }
-
-                const formattedEndTime = formatInTimeZone(endTimeUTC, NIGERIA_TIMEZONE, 'MMM d, yyyy h:mm a zzzz'); // e.g. May 30, 2025 9:00 AM GMT+01:00
-
-                const embed = new EmbedBuilder()
-                    .setColor(0x0099FF)
-                    .setTitle(`🎁 ${itemData.name}`)
-                    .setDescription(`${itemData.description || 'Click the button below to enter!'}\n\nEnds: **${formattedEndTime}**\nWinners: **${winnersCount}**`)
-                    .setTimestamp(endTimeUTC); // Sets embed timestamp to end time
-
-                if (itemData.image_url) {
-                    embed.setImage(itemData.image_url);
-                }
-
-                const participateButton = new ButtonBuilder()
-                    .setCustomId('participate_giveaway')
-                    .setLabel('🎁 Participate (0)')
-                    .setStyle(ButtonStyle.Primary);
-
-                const row = new ActionRowBuilder().addComponents(participateButton);
-
-                const giveawayMsg = await message.channel.send({ embeds: [embed], components: [row] });
-                embed.setFooter({ text: `Giveaway ID: ${giveawayMsg.id}` }); // Add ID after msg is sent
-                await giveawayMsg.edit({ embeds: [embed], components: [row] }); // Edit to include ID
-
-                const { error: giveawaySaveError } = await supabase
-                    .from('giveaways')
-                    .insert({
-                        message_id: giveawayMsg.id,
-                        guild_id: message.guild.id,
-                        channel_id: message.channel.id,
-                        item_id: itemId,
-                        end_time: endTimeUTC.toISOString(),
-                        winners_count: winnersCount,
-                        status: 'active',
-                        participants: []
-                    });
-
-                if (giveawaySaveError) {
-                    console.error("Error saving giveaway to Supabase:", giveawaySaveError);
-                    await giveawayMsg.delete(); // Clean up message if DB save fails
-                    return message.reply("Failed to save giveaway details. Please try again.");
-                }
-                 // No need to reply, the embed is the confirmation
-            } catch (err) {
-                console.error("Error starting giveaway:", err);
-                message.reply("An error occurred while starting the giveaway.");
-            }
-
-        } else if (command === 'cancel') {
-            if (!isAdmin(message.author.id)) return message.reply("You are not authorized to cancel giveaways.");
-            if (args.length < 1) return message.reply(`Usage: ${PREFIX}cancel <giveaway_id (message_id)>`);
-
-            const giveawayIdToCancel = args[0];
-
-            try {
-                const { data: giveawayData, error: fetchError } = await supabase
-                    .from('giveaways')
-                    .select('channel_id, status, item_id, winners_count')
-                    .eq('message_id', giveawayIdToCancel)
-                    .single();
-
-                if (fetchError || !giveawayData) {
-                    return message.reply(`Giveaway with ID ${giveawayIdToCancel} not found or already processed.`);
-                }
-                if (giveawayData.status !== 'active') {
-                    return message.reply(`Giveaway ${giveawayIdToCancel} is not active (current status: ${giveawayData.status}).`);
-                }
-
-                const { error: updateError } = await supabase
-                    .from('giveaways')
-                    .update({ status: 'cancelled' })
-                    .eq('message_id', giveawayIdToCancel);
-
-                if (updateError) throw updateError;
-
-                const giveawayChannel = await client.channels.fetch(giveawayData.channel_id);
-                if (!giveawayChannel) {
-                    console.warn(`Could not fetch channel ${giveawayData.channel_id} for cancelled giveaway ${giveawayIdToCancel}`);
-                    return message.reply(`Cancelled giveaway ${giveawayIdToCancel} in database, but couldn't fetch original message channel.`);
-                }
-                const originalMessage = await giveawayChannel.messages.fetch(giveawayIdToCancel).catch(() => null);
-
-                if (originalMessage) {
-                    const originalEmbed = originalMessage.embeds[0];
-                    if (originalEmbed) {
-                         const cancelledEmbed = EmbedBuilder.from(originalEmbed) // Create from existing
-                            .setTitle(`🚫 CANCELLED: ${originalEmbed.title.replace('🎁 ','')}`)
-                            .setDescription(`This giveaway has been cancelled by an admin.\n\n~~${originalEmbed.description}~~`)
-                            .setColor(0xFF0000); // Red for cancelled
-
-                        const disabledButton = ButtonBuilder.from(originalMessage.components[0].components[0]) // Assuming it's the first button
-                            .setDisabled(true)
-                            .setLabel('🔒 Cancelled');
-
-                        const row = new ActionRowBuilder().addComponents(disabledButton);
-                        await originalMessage.edit({ embeds: [cancelledEmbed], components: [row] });
-                    }
-                }
-                message.reply(`Giveaway ${giveawayIdToCancel} has been cancelled.`);
-
-            } catch (err) {
-                console.error("Error cancelling giveaway:", err);
-                message.reply("An error occurred while cancelling the giveaway.");
-            }
-        }
+    } catch (error) {
+        console.error('Command error:', error);
+        message.reply('❌ An error occurred while processing your command.');
     }
 });
 
-client.on('interactionCreate', async interaction => {
-    if (!interaction.isButton() || interaction.customId !== 'participate_giveaway') return;
+// Button interaction handler
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isButton()) return;
+    
+    if (interaction.customId === 'participate_giveaway') {
+        await handleGiveawayParticipation(interaction);
+    }
+});
 
-    const giveawayMessageId = interaction.message.id;
-    const userId = interaction.user.id;
+// Check if user is admin
+function checkAdmin(userId) {
+    return isAdmin(userId);
+}
 
+// Handle add item command
+async function handleAddItem(message) {
+    itemCreationProcess.set(message.author.id, { step: 'name' });
+    await message.reply('🎁 **Adding new giveaway item**\n\nPlease enter the **item name**:');
+}
+
+// Handle item creation steps
+async function handleItemCreationStep(message) {
+    const process = itemCreationProcess.get(message.author.id);
+    
+    switch (process.step) {
+        case 'name':
+            process.name = message.content.trim();
+            process.step = 'description';
+            await message.reply('📝 **Item name saved!**\n\nNow enter the **description** for this item:');
+            break;
+            
+        case 'description':
+            process.description = message.content.trim();
+            process.step = 'image';
+            await message.reply('🖼️ **Description saved!**\n\nNow send an **image URL** for this item (or type "skip" to skip):');
+            break;
+            
+        case 'image':
+            const imageUrl = message.content.trim().toLowerCase() === 'skip' ? null : message.content.trim();
+            
+            try {
+                const { data, error } = await supabase
+                    .from('items')
+                    .insert({
+                        name: process.name,
+                        description: process.description,
+                        image_url: imageUrl
+                    })
+                    .select()
+                    .single();
+                
+                if (error) throw error;
+                
+                itemCreationProcess.delete(message.author.id);
+                
+                await message.reply(`✅ **Item created successfully!**\n\n**ID:** ${data.id}\n**Name:** ${data.name}\n**Description:** ${data.description}\n**Image:** ${data.image_url || 'None'}`);
+            } catch (error) {
+                console.error('Error creating item:', error);
+                itemCreationProcess.delete(message.author.id);
+                await message.reply('❌ Failed to create item. Please try again.');
+            }
+            break;
+    }
+    
+    itemCreationProcess.set(message.author.id, process);
+}
+
+// Handle list items command
+async function handleListItems(message) {
     try {
-        // Fetch current participants and status
-        const { data: giveaway, error: fetchError } = await supabase
-            .from('giveaways')
-            .select('participants, status, end_time')
-            .eq('message_id', giveawayMessageId)
-            .single();
-
-        if (fetchError || !giveaway) {
-            return interaction.reply({ content: 'Could not find this giveaway in the database.', ephemeral: true });
-        }
-
-        if (giveaway.status !== 'active') {
-            return interaction.reply({ content: 'This giveaway is no longer active.', ephemeral: true });
+        const { data: items, error } = await supabase
+            .from('items')
+            .select('*')
+            .order('id', { ascending: true });
+        
+        if (error) throw error;
+        
+        if (items.length === 0) {
+            return message.reply('📦 No items found. Use `.additem` to add your first item.');
         }
         
-        if (new Date(giveaway.end_time) <= new Date()) {
-             return interaction.reply({ content: 'This giveaway has already ended.', ephemeral: true });
-        }
-
-        if (giveaway.participants.includes(userId)) {
-            return interaction.reply({ content: 'You have already participated in this giveaway!', ephemeral: true });
-        }
-
-        // Add participant
-        const updatedParticipants = [...giveaway.participants, userId];
-        const { error: updateError } = await supabase
-            .from('giveaways')
-            .update({ participants: updatedParticipants })
-            .eq('message_id', giveawayMessageId);
-
-        if (updateError) {
-            console.error("Error updating participants:", updateError);
-            return interaction.reply({ content: 'There was an error registering your participation. Please try again.', ephemeral: true });
-        }
-
-        // Update button label
-        const originalButton = interaction.message.components[0].components[0];
-        const updatedButton = ButtonBuilder.from(originalButton)
-            .setLabel(`🎁 Participate (${updatedParticipants.length})`);
-        const row = new ActionRowBuilder().addComponents(updatedButton);
-
-        await interaction.message.edit({ components: [row] });
-        await interaction.reply({ content: 'You have successfully joined the giveaway! 🎉', ephemeral: true });
-
-    } catch (err) {
-        console.error("Error handling participation button:", err);
-        await interaction.reply({ content: 'An unexpected error occurred.', ephemeral: true }).catch(() => {}); // Catch if interaction already replied
-    }
-});
-
-async function checkEndedGiveaways() {
-    const nowUTC = new Date().toISOString();
-    // console.log(`Checking for ended giveaways at ${nowUTC}...`);
-
-    const { data: endedGiveaways, error: fetchError } = await supabase
-        .from('giveaways')
-        .select('*') // Select all fields needed for processing
-        .eq('status', 'active')
-        .lt('end_time', nowUTC); // Less than current time means it has ended
-
-    if (fetchError) {
-        console.error("Error fetching ended giveaways:", fetchError);
-        return;
-    }
-
-    if (!endedGiveaways || endedGiveaways.length === 0) {
-        // console.log("No active giveaways have ended.");
-        return;
-    }
-
-    for (const giveaway of endedGiveaways) {
-        console.log(`Processing ended giveaway: ${giveaway.message_id}`);
-        let winners = [];
-        const participants = giveaway.participants || [];
-
-        if (participants.length > 0) {
-            if (participants.length <= giveaway.winners_count) {
-                winners = [...participants]; // All participants win if fewer than winner_count
-            } else {
-                // Shuffle participants and pick winners
-                const shuffled = [...participants].sort(() => 0.5 - Math.random());
-                winners = shuffled.slice(0, giveaway.winners_count);
-            }
-        }
-
-        // Update giveaway status and store winners
-        const { error: updateError } = await supabase
-            .from('giveaways')
-            .update({ status: 'ended', winner_ids: winners })
-            .eq('message_id', giveaway.message_id);
-
-        if (updateError) {
-            console.error(`Error updating giveaway ${giveaway.message_id} to ended:`, updateError);
-            continue; // Skip to next giveaway if update fails
-        }
-
-        // Fetch the original message to edit
-        try {
-            const channel = await client.channels.fetch(giveaway.channel_id).catch(() => null);
-            if (!channel) {
-                console.warn(`Could not fetch channel ${giveaway.channel_id} for giveaway ${giveaway.message_id}`);
-                continue;
-            }
-            const message = await channel.messages.fetch(giveaway.message_id).catch(() => null);
-            if (!message) {
-                console.warn(`Could not fetch message ${giveaway.message_id} in channel ${giveaway.channel_id}`);
-                continue;
-            }
-
-            const itemDetails = await supabase.from('items').select('name').eq('id', giveaway.item_id).single();
-            const itemName = itemDetails.data ? itemDetails.data.name : "the prize";
-
-            const originalEmbed = message.embeds[0];
-            const endedEmbed = EmbedBuilder.from(originalEmbed) // Create from existing
-                .setTitle(`🎉 ENDED: ${originalEmbed.title.replace('🎁 ','')}`)
-                .setColor(0x57F287); // Green for ended
-
-            let description = originalEmbed.description;
-            // Remove old "Ends:" and "Winners:" lines to replace them cleanly
-            description = description.replace(/Ends: .*\nWinners: .*\n?/, ''); // Regex to remove these lines
-
-            if (winners.length > 0) {
-                const winnerMentions = winners.map(id => `<@${id}>`).join(', ');
-                endedEmbed.setDescription(`${description}\n\n**🏆 Congratulations to the winner(s)!**\n${winnerMentions}`);
-            } else {
-                endedEmbed.setDescription(`${description}\n\n**😔 No participants joined this giveaway.**`);
-            }
-
-            const disabledButton = ButtonBuilder.from(message.components[0].components[0])
-                .setDisabled(true)
-                .setLabel('🔒 Ended');
-            if (participants.length > 0) { // Keep participant count if there were any
-                 disabledButton.setLabel(`🎁 Ended (${participants.length})`);
-            }
-
-
-            const row = new ActionRowBuilder().addComponents(disabledButton);
-
-            await message.edit({ embeds: [endedEmbed], components: [row] });
-
-            // Announce winners by mentioning them in a new message (as per common practice, though spec says edit original)
-            // Spec says: "Announces the winners by mentioning them" (in the edited message)
-            // The above edit includes mentions. If a separate message is desired, uncomment below.
-            // if (winners.length > 0) {
-            //    const winnerMentions = winners.map(id => `<@${id}>`).join(', ');
-            //    await channel.send(`Congratulations ${winnerMentions}! You won **${itemName}** from giveaway ID ${giveaway.message_id}!`);
-            // }
-
-            console.log(`Giveaway ${giveaway.message_id} ended. Winners: ${winners.join(', ')}`);
-
-        } catch (err) {
-            console.error(`Error finalizing giveaway ${giveaway.message_id} on Discord:`, err);
-        }
+        const itemList = items.map(item => 
+            `**ID ${item.id}:** ${item.name}\n📝 ${item.description}\n🖼️ ${item.image_url || 'No image'}`
+        ).join('\n\n');
+        
+        await message.reply(`📦 **Available Giveaway Items:**\n\n${itemList}`);
+    } catch (error) {
+        console.error('Error fetching items:', error);
+        message.reply('❌ Failed to fetch items.');
     }
 }
 
-// Graceful shutdown
-process.on('SIGINT', () => {
-    console.log("Shutting down bot...");
-    client.destroy();
-    process.exit(0);
-});
-process.on('SIGTERM', () => {
-    console.log("Shutting down bot...");
-    client.destroy();
-    process.exit(0);
-});
+// Handle start giveaway command
+async function handleStartGiveaway(message, args) {
+    if (args.length !== 3) {
+        return message.reply('❌ **Usage:** `.giveaway <item_id> <end_time> <winners_count>`\n**Example:** `.giveaway 1 9:00AM 2`');
+    }
+    
+    const [itemId, timeStr, winnersStr] = args;
+    
+    try {
+        // Validate item ID
+        const itemIdNum = parseInt(itemId);
+        if (isNaN(itemIdNum)) {
+            return message.reply('❌ Invalid item ID. It must be a number.');
+        }
+        
+        // Validate winners count
+        const winnersCount = parseInt(winnersStr);
+        if (isNaN(winnersCount) || winnersCount < 1) {
+            return message.reply('❌ Winners count must be a positive number.');
+        }
+        
+        // Parse end time
+        const endTime = parseTimeToNigeria(timeStr);
+        
+        // Get item from database
+        const { data: item, error: itemError } = await supabase
+            .from('items')
+            .select('*')
+            .eq('id', itemIdNum)
+            .single();
+        
+        if (itemError || !item) {
+            return message.reply('❌ Item not found. Use `.items` to see available items.');
+        }
+        
+        // Create giveaway embed and button
+        const embed = createGiveawayEmbed(item, endTime, winnersCount, 0);
+        const button = createGiveawayButton(0);
+        
+        // Send giveaway message
+        const giveawayMessage = await message.channel.send({
+            embeds: [embed],
+            components: [button]
+        });
+        
+        // Save giveaway to database
+        const { data: giveaway, error: giveawayError } = await supabase
+            .from('giveaways')
+            .insert({
+                item_id: itemIdNum,
+                channel_id: message.channel.id,
+                message_id: giveawayMessage.id,
+                guild_id: message.guild.id,
+                end_time: endTime.toISOString(),
+                winners_count: winnersCount,
+                created_by: message.author.id
+            })
+            .select()
+            .single();
+        
+        if (giveawayError) throw giveawayError;
+        
+        // Update embed with giveaway ID
+        const updatedEmbed = createGiveawayEmbed(item, endTime, winnersCount, 0, giveaway.id);
+        await giveawayMessage.edit({
+            embeds: [updatedEmbed],
+            components: [button]
+        });
+        
+        await message.reply(`✅ Giveaway started successfully! **Giveaway ID:** ${giveaway.id}`);
+        
+    } catch (error) {
+        console.error('Error starting giveaway:', error);
+        message.reply(`❌ ${error.message || 'Failed to start giveaway.'}`);
+    }
+}
 
+// Handle cancel giveaway command
+async function handleCancelGiveaway(message, args) {
+    if (args.length !== 1) {
+        return message.reply('❌ **Usage:** `.cancel <giveaway_id>`\n**Example:** `.cancel 5`');
+    }
+    
+    const giveawayId = parseInt(args[0]);
+    
+    if (isNaN(giveawayId)) {
+        return message.reply('❌ Invalid giveaway ID. It must be a number.');
+    }
+    
+    try {
+        // Get giveaway from database
+        const { data: giveaway, error: giveawayError } = await supabase
+            .from('giveaways')
+            .select(`
+                *,
+                items (*)
+            `)
+            .eq('id', giveawayId)
+            .eq('status', 'active')
+            .single();
+        
+        if (giveawayError || !giveaway) {
+            return message.reply('❌ Giveaway not found or already ended/cancelled.');
+        }
+        
+        // Get participant count
+        const { count: participantCount } = await supabase
+            .from('giveaway_participants')
+            .select('*', { count: 'exact', head: true })
+            .eq('giveaway_id', giveawayId);
+        
+        // Update giveaway status
+        await supabase
+            .from('giveaways')
+            .update({ status: 'cancelled' })
+            .eq('id', giveawayId);
+        
+        // Update original message
+        const channel = await client.channels.fetch(giveaway.channel_id);
+        const giveawayMessage = await channel.messages.fetch(giveaway.message_id);
+        
+        const cancelledEmbed = createCancelledGiveawayEmbed(giveaway.items, participantCount, giveawayId);
+        const disabledButton = createGiveawayButton(participantCount, true);
+        
+        await giveawayMessage.edit({
+            embeds: [cancelledEmbed],
+            components: [disabledButton]
+        });
+        
+        await message.reply(`✅ Giveaway #${giveawayId} has been cancelled.`);
+        
+    } catch (error) {
+        console.error('Error cancelling giveaway:', error);
+        message.reply('❌ Failed to cancel giveaway.');
+    }
+}
 
-client.login(BOT_TOKEN).catch(err => {
-    console.error("Failed to login to Discord:", err);
-    process.exit(1);
-});
+// Handle giveaway participation
+async function handleGiveawayParticipation(interaction) {
+    try {
+        // Get giveaway from database using message ID
+        const { data: giveaway, error: giveawayError } = await supabase
+            .from('giveaways')
+            .select(`
+                *,
+                items (*)
+            `)
+            .eq('message_id', interaction.message.id)
+            .eq('status', 'active')
+            .single();
+        
+        if (giveawayError || !giveaway) {
+            return interaction.reply({ content: '❌ This giveaway is no longer active.', ephemeral: true });
+        }
+        
+        // Check if giveaway has ended
+        if (new Date() >= new Date(giveaway.end_time)) {
+            return interaction.reply({ content: '❌ This giveaway has already ended.', ephemeral: true });
+        }
+        
+        // Try to add participant
+        const { error: participantError } = await supabase
+            .from('giveaway_participants')
+            .insert({
+                giveaway_id: giveaway.id,
+                user_id: interaction.user.id
+            });
+        
+        if (participantError) {
+            if (participantError.code === '23505') { // Unique constraint violation
+                return interaction.reply({ content: '❌ You are already participating in this giveaway!', ephemeral: true });
+            }
+            throw participantError;
+        }
+        
+        // Get updated participant count
+        const { count: participantCount } = await supabase
+            .from('giveaway_participants')
+            .select('*', { count: 'exact', head: true })
+            .eq('giveaway_id', giveaway.id);
+        
+        // Update message with new participant count
+        const updatedEmbed = createGiveawayEmbed(giveaway.items, new Date(giveaway.end_time), giveaway.winners_count, participantCount, giveaway.id);
+        const updatedButton = createGiveawayButton(participantCount);
+        
+        await interaction.update({
+            embeds: [updatedEmbed],
+            components: [updatedButton]
+        });
+        
+        await interaction.followUp({ content: '✅ You have successfully joined the giveaway!', ephemeral: true });
+        
+    } catch (error) {
+        console.error('Error handling participation:', error);
+        interaction.reply({ content: '❌ Failed to join giveaway. Please try again.', ephemeral: true });
+    }
+}
+
+// Check for expired giveaways
+async function checkExpiredGiveaways() {
+    try {
+        const { data: expiredGiveaways, error } = await supabase
+            .from('giveaways')
+            .select(`
+                *,
+                items (*)
+            `)
+            .eq('status', 'active')
+            .lt('end_time', new Date().toISOString());
+        
+        if (error) throw error;
+        
+        for (const giveaway of expiredGiveaways) {
+            await endGiveaway(giveaway);
+        }
+        
+    } catch (error) {
+        console.error('Error checking expired giveaways:', error);
+    }
+}
+
+// End a giveaway
+async function endGiveaway(giveaway) {
+    try {
+        // Get all participants
+        const { data: participants, error: participantsError } = await supabase
+            .from('giveaway_participants')
+            .select('user_id')
+            .eq('giveaway_id', giveaway.id);
+        
+        if (participantsError) throw participantsError;
+        
+        // Select winners
+        const participantIds = participants.map(p => p.user_id);
+        const winners = selectRandomWinners(participantIds, giveaway.winners_count);
+        
+        // Save winners to database
+        if (winners.length > 0) {
+            const winnerData = winners.map(userId => ({
+                giveaway_id: giveaway.id,
+                user_id: userId
+            }));
+            
+            await supabase.from('giveaway_winners').insert(winnerData);
+        }
+        
+        // Update giveaway status
+        await supabase
+            .from('giveaways')
+            .update({ status: 'ended' })
+            .eq('id', giveaway.id);
+        
+        // Update original message
+        const channel = await client.channels.fetch(giveaway.channel_id);
+        const giveawayMessage = await channel.messages.fetch(giveaway.message_id);
+        
+        const endedEmbed = createEndedGiveawayEmbed(giveaway.items, winners, participants.length, giveaway.id);
+        const disabledButton = createGiveawayButton(participants.length, true);
+        
+        await giveawayMessage.edit({
+            embeds: [endedEmbed],
+            components: [disabledButton]
+        });
+        
+        console.log(`✅ Giveaway #${giveaway.id} ended. Winners: ${winners.length}`);
+        
+    } catch (error) {
+        console.error(`Error ending giveaway #${giveaway.id}:`, error);
+    }
+}
+
+// Login to Discord
+client.login(process.env.DISCORD_TOKEN);
