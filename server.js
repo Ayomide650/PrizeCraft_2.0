@@ -1,19 +1,31 @@
-// server.js
 const express = require('express');
 const app = express();
-require('dotenv').config(); // For local development, Render will inject PORT
+const PORT = process.env.PORT || 3000;
 
-const PORT = process.env.PORT || 3000; // Render provides process.env.PORT
+// Basic middleware
+app.use(express.json());
 
-// Start the Discord bot
-require('./index.js'); // This line executes your main bot code
-
+// Health check endpoint
 app.get('/', (req, res) => {
-  res.send('Giveaway Bot is alive!');
+    res.json({ 
+        status: 'Bot is running!', 
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime()
+    });
 });
 
-app.listen(PORT, () => {
-  // This log message is crucial. If you don't see it in your Render logs,
-  // the server isn't successfully starting to listen.
-  console.log(`Server listening on port ${PORT}. Health check available at /`);
+// Status endpoint
+app.get('/status', (req, res) => {
+    res.json({ 
+        status: 'healthy',
+        service: 'discord-giveaway-bot',
+        timestamp: new Date().toISOString()
+    });
 });
+
+// Start server
+app.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
+});
+
+module.exports = app;
